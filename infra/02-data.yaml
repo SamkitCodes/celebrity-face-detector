@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Celebrity Face Detector - data tier. Private, encrypted S3 bucket for uploads
+  (auto-deleted after 1 day) and a DynamoDB table for jobs and per-user quotas
+  (TTL-expired). Bucket events go to EventBridge so processing stays decoupled.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cfd
+  AllowedOrigin:
+    Type: String
+    Description: >
+      Browser origin allowed to POST uploads to S3 (the CloudFront URL). The
+      deploy script sets this after the edge stack exists.
+    Default: http://localhost:5173
+    AllowedPattern: "^https?://[a-zA-Z0-9.:-]+$"
+
+Resources:
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Access logs cost extra for a test project"
+          - id: CKV_AWS_21
+            comment: "Uploads are deliberately ephemeral (1-day lifecycle); versions would retain face photos"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # Privacy: face photos never live longer than a day.
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUploads
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  UploadsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt UploadsBucket.Arn
+              - !Sub "${UploadsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # Single-table design:
+  #   PK=USER#<sub>  SK=JOB#<jobId>          -> an analysis job and its result
+  #   PK=USER#<sub>  SK=QUOTA#<YYYY-MM-DD>   -> daily upload counter
+  # Both carry `expiresAt` so DynamoDB TTL deletes them for free.
+  Table:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_119
+            comment: "AWS-owned key encryption is free; a CMK adds a monthly fee"
+          - id: CKV_AWS_28
+            comment: "Data is ephemeral (24h TTL); PITR adds cost with no benefit"
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      # Encrypted at rest by default with an AWS-owned key (free). A customer
+      # managed KMS key would add a monthly fee, so it is deliberately not used.
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  UploadsBucketName:
+    Value: !Ref UploadsBucket
+    Export:
+      Name: !Sub "${ProjectName}-UploadsBucket"
+  UploadsBucketArn:
+    Value: !GetAtt UploadsBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-UploadsBucketArn"
+  TableName:
+    Value: !Ref Table
+    Export:
+      Name: !Sub "${ProjectName}-TableName"
+  TableArn:
+    Value: !GetAtt Table.Arn
+    Export:
+      Name: !Sub "${ProjectName}-TableArn"

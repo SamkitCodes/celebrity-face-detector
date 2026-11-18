@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Celebrity Face Detector - presentation tier. CloudFront is the single entry
+  point: "/*" serves the React build from a private S3 bucket (Origin Access
+  Control), "/api/*" goes to the private EC2 API through a VPC origin.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cfd
+  InstanceArn:
+    Type: String
+    Description: ARN of the API instance (from the app stack, passed by deploy.sh)
+  InstancePrivateDnsName:
+    Type: String
+    Description: Private DNS name of the API instance
+
+Mappings:
+  # AWS managed policy IDs (global, stable).
+  ManagedPolicies:
+    Ids:
+      CachingOptimized: 658327ea-f89d-4fab-a63d-7e88639e58f6
+      AllViewerExceptHostHeader: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+Resources:
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Access logs cost extra for a test project"
+          - id: CKV_AWS_21
+            comment: "Site is rebuilt from git on every deploy"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  WebOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-web-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront reaches the instance's private IP through service-managed ENIs.
+  # The instance has no public IP and is not reachable from the internet.
+  ApiVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub "${ProjectName}-api"
+        Arn: !Ref InstanceArn
+        HTTPPort: 3000
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+
+  # Effectively no caching for the API, but Authorization must be part of the
+  # cache key for CloudFront to forward it (MaxTTL 1 allows that).
+  ApiCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${ProjectName}-api-no-cache"
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 1
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers: [Authorization]
+          QueryStringsConfig:
+            QueryStringBehavior: all
+          CookiesConfig:
+            CookieBehavior: none
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${ProjectName}-security-headers"
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub
+              - >-
+                default-src 'self'; script-src 'self'; style-src 'self';
+                img-src 'self' data: blob: https://${Bucket}.s3.${AWS::Region}.amazonaws.com https://${Bucket}.s3.amazonaws.com;
+                connect-src 'self' https://cognito-idp.${AWS::Region}.amazonaws.com https://${Bucket}.s3.${AWS::Region}.amazonaws.com https://${Bucket}.s3.amazonaws.com;
+                frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'
+              - Bucket: !ImportValue
+                  Fn::Sub: "${ProjectName}-UploadsBucket"
+          StrictTransportSecurity:
+            Override: true
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            Override: true
+            FrameOption: DENY
+          ReferrerPolicy:
+            Override: true
+            ReferrerPolicy: strict-origin-when-cross-origin
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_68
+            comment: "WAF has a fixed monthly cost; rate limiting is done per user in the API"
+          - id: CKV_AWS_86
+            comment: "Access logging skipped to stay within the test budget"
+          - id: CKV_AWS_174
+            comment: "Default *.cloudfront.net certificate cannot set a minimum TLS version; needs a custom domain + ACM"
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${ProjectName} celebrity face detector"
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt WebOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: api
+            DomainName: !Ref InstancePrivateDnsName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt ApiVpcOrigin.Id
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !FindInMap [ManagedPolicies, Ids, CachingOptimized]
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            Compress: true
+            CachePolicyId: !Ref ApiCachePolicy
+            OriginRequestPolicyId: !FindInMap [ManagedPolicies, Ids, AllViewerExceptHostHeader]
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt WebBucket.Arn
+              - !Sub "${WebBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  WebBucketName:
+    Value: !Ref WebBucket
+  DistributionId:
+    Value: !Ref Distribution
+  SiteUrl:
+    Value: !Sub "https://${Distribution.DomainName}"

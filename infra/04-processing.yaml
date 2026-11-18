@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Celebrity Face Detector - processing. S3 "Object Created" events (via
+  EventBridge) trigger a Python Lambda that calls Rekognition
+  RecognizeCelebrities, stores the result in DynamoDB and optionally emails it
+  via SES. Failures land in an encrypted SQS dead-letter queue.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cfd
+  SenderEmail:
+    Type: String
+    Description: >
+      Verified SES identity used as the sender. In the SES sandbox the
+      recipient must be verified too, so use your own email.
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  MinConfidence:
+    Type: Number
+    Default: 80
+    MinValue: 50
+    MaxValue: 100
+
+Resources:
+  # Creating this sends a verification email; click the link before testing email.
+  SenderIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SenderEmail
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_27
+            comment: "Encrypted with SSE-SQS (SqsManagedSseEnabled); KMS CMK adds cost"
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DeadLetterQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeRule
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt UploadCreatedRule.Arn
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "Logs contain no secrets; CMK adds a monthly fee"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-processor"
+      RetentionInDays: 7
+
+  # Least privilege: every statement is scoped to a specific resource, except
+  # RecognizeCelebrities, which does not support resource-level permissions.
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: processor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${ProcessorLogGroup.Arn}:*"
+              - Sid: ReadUploads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - "${BucketArn}/uploads/*"
+                  - BucketArn: !ImportValue
+                      Fn::Sub: "${ProjectName}-UploadsBucketArn"
+              - Sid: Rekognition
+                Effect: Allow
+                Action: rekognition:RecognizeCelebrities
+                Resource: "*"
+              - Sid: WriteResults
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !ImportValue
+                  Fn::Sub: "${ProjectName}-TableArn"
+              - Sid: LookupEmail
+                Effect: Allow
+                Action:
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:ListUsers
+                Resource: !ImportValue
+                  Fn::Sub: "${ProjectName}-UserPoolArn"
+              - Sid: SendEmail
+                Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: !Ref SenderEmail
+              - Sid: DeadLetter
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: "Async failures go to the SQS queue via EventInvokeConfig OnFailure destination"
+          - id: CKV_AWS_117
+            comment: "Not in the VPC on purpose: Rekognition/SES/Cognito would need a NAT gateway or paid interface endpoints"
+          - id: CKV_AWS_115
+            comment: "Reserved concurrency can fail on new accounts with low limits; per-user daily quota caps usage"
+          - id: CKV_AWS_173
+            comment: "Environment variables hold no secrets and are encrypted at rest with an AWS managed key"
+    Properties:
+      FunctionName: !Sub "${ProjectName}-processor"
+      Description: Recognizes celebrities in uploaded images with Rekognition
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      # `aws cloudformation package` uploads this folder and rewrites the path.
+      Code: ../lambda/processor
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt ProcessorRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ProcessorLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          TABLE_NAME: !ImportValue
+            Fn::Sub: "${ProjectName}-TableName"
+          USER_POOL_ID: !ImportValue
+            Fn::Sub: "${ProjectName}-UserPoolId"
+          SENDER_EMAIL: !Ref SenderEmail
+          MIN_CONFIDENCE: !Ref MinConfidence
+
+  ProcessorInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 1
+      MaximumEventAgeInSeconds: 3600
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt DeadLetterQueue.Arn
+
+  UploadCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: New object under uploads/ in the uploads bucket
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name:
+              - !ImportValue
+                Fn::Sub: "${ProjectName}-UploadsBucket"
+          object:
+            key:
+              - prefix: uploads/
+      Targets:
+        - Id: processor
+          Arn: !GetAtt ProcessorFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt DeadLetterQueue.Arn
+
+  AllowEventBridgeInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UploadCreatedRule.Arn
+
+Outputs:
+  ProcessorFunctionName:
+    Value: !Ref ProcessorFunction
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue

@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.build/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+
+# Never commit credentials or local config
+.env
+.env.*
+*.pem
+.aws/
+api/jwks.json
+
+# Personal docs and settings - never pushed
+local/
+.env.local
+*.zip
+
+# Python virtualenv
+.venv/

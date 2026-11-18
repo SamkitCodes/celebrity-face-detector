@@ -1,0 +1,5 @@
+templates:
+  - infra/*.yaml
+ignore_checks:
+  # 04-processing.yaml uses a local Code path that `aws cloudformation package` rewrites.
+  - W3002

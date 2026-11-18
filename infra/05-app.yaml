@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Celebrity Face Detector - application tier. Node.js API on an EC2 instance in
+  a private subnet: no public IP, no SSH, no internet egress. Only CloudFront
+  can reach it; it can only reach S3 and DynamoDB through gateway endpoints.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cfd
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+    AllowedValues: [t4g.nano, t4g.micro, t4g.small]
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  AppBundleKey:
+    Type: String
+    Description: S3 key of the app bundle in the artifacts bucket (content-hashed).
+    AllowedPattern: "^app/[a-zA-Z0-9._-]+\\.tar\\.gz$"
+  CloudFrontPrefixListId:
+    Type: String
+    Description: com.amazonaws.global.cloudfront.origin-facing (looked up by deploy.sh)
+  S3PrefixListId:
+    Type: String
+    Description: com.amazonaws.<region>.s3 (looked up by deploy.sh)
+  DynamoDbPrefixListId:
+    Type: String
+    Description: com.amazonaws.<region>.dynamodb (looked up by deploy.sh)
+  DailyUploadLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 200
+
+Resources:
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API instance - CloudFront in, S3/DynamoDB out
+      VpcId: !ImportValue
+        Fn::Sub: "${ProjectName}-VpcId"
+      SecurityGroupIngress:
+        - Description: CloudFront origin-facing only
+          IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+      SecurityGroupEgress:
+        - Description: S3 via gateway endpoint
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref S3PrefixListId
+        - Description: DynamoDB via gateway endpoint
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref DynamoDbPrefixListId
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-app-sg"
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadAppBundle
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - "${BucketArn}/app/*"
+                  - BucketArn: !ImportValue
+                      Fn::Sub: "${ProjectName}-ArtifactsBucketArn"
+              # PutObject is needed to sign presigned upload URLs; the URL
+              # itself restricts key, size and content type.
+              - Sid: Uploads
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub
+                  - "${BucketArn}/uploads/*"
+                  - BucketArn: !ImportValue
+                      Fn::Sub: "${ProjectName}-UploadsBucketArn"
+              - Sid: Table
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource: !ImportValue
+                  Fn::Sub: "${ProjectName}-TableArn"
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppRole]
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        # IMDSv2 only (blocks SSRF-style credential theft), hop limit 1.
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        Monitoring:
+          Enabled: false
+        # T4g defaults to "unlimited" burst, which can bill extra CPU credits.
+        # "standard" throttles instead, so the hourly price is the max price.
+        CreditSpecification:
+          CpuCredits: standard
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      IamInstanceProfile: !Ref AppInstanceProfile
+      SubnetId: !ImportValue
+        Fn::Sub: "${ProjectName}-PrivateSubnetA"
+      SecurityGroupIds: [!Ref AppSecurityGroup]
+      # No KeyName: there is no SSH. Boot logs go to the serial console:
+      #   aws ec2 get-console-output --instance-id <id> --latest --output text
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euo pipefail
+            exec > >(tee /var/log/cfd-bootstrap.log /dev/console) 2>&1
+            echo "cfd: bootstrapping bundle ${AppBundleKey}"
+            export AWS_REGION=${AWS::Region}
+            useradd --system --no-create-home --shell /sbin/nologin cfd || true
+            mkdir -p /opt/cfd
+            aws s3 cp "s3://${ArtifactsBucket}/${AppBundleKey}" /tmp/bundle.tar.gz
+            tar -xzf /tmp/bundle.tar.gz -C /opt/cfd
+            rm -f /tmp/bundle.tar.gz
+            chown -R root:root /opt/cfd
+
+            cat > /etc/cfd.env <<EOF
+            NODE_ENV=production
+            PORT=3000
+            AWS_REGION=${AWS::Region}
+            TABLE_NAME=${TableName}
+            UPLOADS_BUCKET=${UploadsBucket}
+            USER_POOL_ID=${UserPoolId}
+            WEB_CLIENT_ID=${WebClientId}
+            DAILY_UPLOAD_LIMIT=${DailyUploadLimit}
+            EOF
+
+            cat > /etc/systemd/system/cfd-api.service <<'EOF'
+            [Unit]
+            Description=Celebrity Face Detector API
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            User=cfd
+            EnvironmentFile=/etc/cfd.env
+            WorkingDirectory=/opt/cfd/app
+            ExecStart=/opt/cfd/node/bin/node src/server.js
+            Restart=always
+            RestartSec=3
+            NoNewPrivileges=true
+            ProtectSystem=strict
+            ProtectHome=true
+            PrivateTmp=true
+            PrivateDevices=true
+            ProtectKernelTunables=true
+            ProtectControlGroups=true
+            RestrictSUIDSGID=true
+            CapabilityBoundingSet=
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable --now cfd-api
+            sleep 3
+            systemctl is-active cfd-api && echo "cfd: API is running"
+          - ArtifactsBucket: !ImportValue
+              Fn::Sub: "${ProjectName}-ArtifactsBucket"
+            TableName: !ImportValue
+              Fn::Sub: "${ProjectName}-TableName"
+            UploadsBucket: !ImportValue
+              Fn::Sub: "${ProjectName}-UploadsBucket"
+            UserPoolId: !ImportValue
+              Fn::Sub: "${ProjectName}-UserPoolId"
+            WebClientId: !ImportValue
+              Fn::Sub: "${ProjectName}-WebClientId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-api"
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  InstanceId:
+    Value: !Ref AppInstance
+  InstanceArn:
+    Value: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${AppInstance}"
+  InstancePrivateDnsName:
+    Value: !GetAtt AppInstance.PrivateDnsName
